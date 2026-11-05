@@ -1,0 +1,152 @@
+name: Build, test and publish image
+
+# Reusable workflow for the langrenn-sprint service and GUI repos.
+#
+# Builds the image once, in its own step, with OCI labels
+# (org.opencontainers.image.revision, created, source, ...) and tags it
+# ghcr.io/<owner>/<repo>:test. The tests then run with IMAGE_PREBUILT=1,
+# so contract tests (pytest-docker) use that image instead of building
+# again. With `publish: true` the tested image is re-tagged to `latest`
+# and `sha-<short>` and pushed, so what is published is exactly what was
+# tested.
+#
+# The caller job must grant `packages: write` when publishing.
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: Push the tested image as `latest` and `sha-<short>`.
+        type: boolean
+        default: false
+      uv-version:
+        description: uv version to install. Empty means latest.
+        type: string
+        default: ""
+      uv-sync-args:
+        description: Arguments to `uv sync`.
+        type: string
+        default: "--locked --all-extras --dev"
+      test-command:
+        description: Command that runs linters, checks and tests.
+        type: string
+        default: "uv run poe release"
+      test-env:
+        description: Extra environment variables for the tests, one KEY=value per line.
+        type: string
+        default: ""
+    secrets:
+      JWT_SECRET:
+        required: false
+      ADMIN_USERNAME:
+        required: false
+      ADMIN_PASSWORD:
+        required: false
+      DB_USER:
+        required: false
+      DB_PASSWORD:
+        required: false
+
+jobs:
+  build-test-publish:
+    name: Build, test and publish
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ inputs.uv-version }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install the project
+        run: uv sync ${{ inputs.uv-sync-args }}
+
+      # Only secrets the caller passes are exported, so a missing secret
+      # stays unset instead of becoming an empty string.
+      - name: Set test environment
+        env:
+          TEST_ENV: ${{ inputs.test-env }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export_var() {
+            local delimiter
+            delimiter="EOF_$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$1" "$delimiter" "$2" "$delimiter" >> "$GITHUB_ENV"
+          }
+          lineno=0
+          while IFS= read -r line; do
+            lineno=$((lineno + 1))
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              echo "::error::test-env line $lineno is not KEY=value"
+              exit 1
+            fi
+            export_var "${line%%=*}" "${line#*=}"
+          done <<< "$TEST_ENV"
+          for name in JWT_SECRET ADMIN_USERNAME ADMIN_PASSWORD DB_USER DB_PASSWORD; do
+            if [[ -n "${!name}" ]]; then
+              export_var "$name" "${!name}"
+            fi
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:test
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run linters, checks and tests
+        env:
+          IMAGE_PREBUILT: "1"
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: eval "$TEST_COMMAND"
+
+      - name: Log in to registry
+        if: inputs.publish
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and publish image
+        if: inputs.publish
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |-
+          set -euo pipefail
+          for tag in $TAGS; do
+            docker tag "$IMAGE:test" "$tag"
+            docker push "$tag"
+          done
+          docker rmi "$IMAGE:test"
